@@ -794,6 +794,64 @@ const DATA = {"generated_at": "2026-07-15 17:42:21", "year_range": "2016-2026", 
     return (s||'').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
+  // Strips accents (á -> a, ü -> u, etc.) for matching purposes only. This
+  // is length-preserving character-for-character (NFKD decomposes each
+  // accented letter into base+combining-mark, and removing the combining
+  // mark brings it back to exactly one character), so an index range found
+  // in the stripped text lines up exactly with the same range in the
+  // original, accented text.
+  function stripDiacritics(s){
+    return (s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  }
+
+  // Finds matches for `regex` in the accent-stripped version of `html`, but
+  // wraps the corresponding <strong> tags around the ORIGINAL (accented)
+  // text, so e.g. roster "Kubatova" still correctly bolds actual citation
+  // text "Kubátová" without losing the accent.
+  function boldDiacriticInsensitive(html, regex){
+    const normalized = stripDiacritics(html);
+    if(normalized.length !== html.length) return html; // safety net, skip if alignment assumption ever fails
+    let result = '';
+    let lastIndex = 0;
+    let m;
+    regex.lastIndex = 0;
+    while((m = regex.exec(normalized)) !== null){
+      result += html.slice(lastIndex, m.index);
+      result += `<strong>${html.slice(m.index, m.index + m[0].length)}</strong>`;
+      lastIndex = m.index + m[0].length;
+      if(m.index === regex.lastIndex) regex.lastIndex++;
+    }
+    result += html.slice(lastIndex);
+    return result;
+  }
+
+  // Mirrors the Python side's NameVariants parsing: "C.C. Prescott;
+  // Cynthia Coleman Prescott" or "Prescott, C.C." -> [{last, first}, ...].
+  // A person can be matched to a work via one of these alternate names
+  // (different spelling, different surname, even reversed name order), so
+  // bolding needs to try all of them, not just the roster's primary name.
+  function parseNameVariantsJS(variantsStr){
+    const out = [];
+    (variantsStr || '').split(';').forEach(part=>{
+      part = part.trim();
+      if(!part) return;
+      let last, first;
+      if(part.includes(',')){
+        const [lastPart, firstPart] = part.split(',');
+        last = (lastPart || '').trim();
+        const firstTokens = (firstPart || '').trim().split(/\s+/);
+        first = firstTokens[0] || '';
+      } else {
+        const tokens = part.split(/\s+/);
+        if(!tokens.length) return;
+        last = tokens[tokens.length - 1];
+        first = tokens[0];
+      }
+      if(last && first) out.push({last, first});
+    });
+    return out;
+  }
+
   // Builds the citation HTML with matched UND faculty authors in bold and
   // the journal/venue name in italics, working entirely on already-escaped
   // text so nothing from the data can inject markup.
@@ -812,11 +870,18 @@ const DATA = {"generated_at": "2026-07-15 17:42:21", "year_range": "2016-2026", 
     let authorsHtml = escapeHtml(authorsPart);
     (w.matched_faculty_ids || []).forEach(fid=>{
       const f = facultyById[fid];
-      if(!f || !f.Lastname || !f.Firstname) return;
-      const firstInitial = f.Firstname.trim()[0];
-      if(!firstInitial) return;
-      const re = new RegExp(`\\b${escRegex(f.Lastname)},\\s*${escRegex(firstInitial)}\\.(?:\\s*[A-Za-z]\\.)*`, 'g');
-      authorsHtml = authorsHtml.replace(re, m => `<strong>${m}</strong>`);
+      if(!f) return;
+      const identities = [{last: f.Lastname, first: f.Firstname}]
+        .concat(parseNameVariantsJS(f.NameVariants));
+      identities.forEach(({last, first})=>{
+        if(!last || !first) return;
+        const firstInitial = first.trim()[0];
+        if(!firstInitial) return;
+        const normLast = stripDiacritics(last);
+        const normInitial = stripDiacritics(firstInitial);
+        const re = new RegExp(`\\b${escRegex(normLast)},\\s*${escRegex(normInitial)}\\.(?:\\s*[A-Za-z]\\.)*`, 'gi');
+        authorsHtml = boldDiacriticInsensitive(authorsHtml, re);
+      });
     });
 
     let restHtml = escapeHtml(restPart);
